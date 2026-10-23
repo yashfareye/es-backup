@@ -1,0 +1,5 @@
+apiVersion: v2
+name: es-restore-chart
+description: A Helm chart for restoring Elasticsearch from S3
+type: application
+version: 1.0.0

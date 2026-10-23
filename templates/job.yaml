@@ -1,0 +1,59 @@
+{{- range $cluster := .Values.clusters }}
+{{- if $cluster.enabled }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $.Release.Name }}-{{ $cluster.name }}-es-restore
+  namespace: {{ $cluster.namespace }}
+spec:
+  activeDeadlineSeconds: 3900
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: {{ $.Release.Name }}-{{ $cluster.name }}-restore
+    spec:
+      serviceAccountName: {{ $.Release.Name }}-{{ $cluster.name }}-es-restore-sa
+      restartPolicy: Never
+      containers:
+        - name: restore-orchestrator
+          image: bitnami/kubectl:latest
+          securityContext:
+            runAsUser: 0
+          command: ["/bin/bash", "/scripts/restore.sh"]
+          env:
+            - name: ES_HOST
+              value: {{ $cluster.elasticsearch.host | quote }}
+            - name: REPO_NAME
+              value: {{ $cluster.s3.repoName | quote }}
+            - name: S3_BUCKET
+              value: {{ $cluster.s3.bucket | quote }}
+            - name: BASE_PATH
+              value: {{ $cluster.s3.basePath | quote }}
+            - name: S3_REGION
+              value: {{ $cluster.s3.region | quote }}
+            - name: KIBANA
+              value: {{ $cluster.kibana.deploymentName | quote }}
+            - name: NAMESPACE
+              value: {{ $cluster.namespace | quote }}
+            - name: STATE_CONFIGMAP
+              value: "{{ $.Release.Name }}-{{ $cluster.name }}-es-restore-state"
+            - name: CURL_TIMEOUT
+              value: {{ $cluster.timeouts.curl | quote }}
+            - name: KIBANA_TIMEOUT
+              value: {{ $cluster.timeouts.kibana | quote }}
+            - name: ES_HEALTH_TIMEOUT
+              value: {{ $cluster.timeouts.esHealth | quote }}
+            - name: HEALTH_INTERVAL
+              value: {{ $cluster.timeouts.healthInterval | quote }}
+          volumeMounts:
+            - name: script-volume
+              mountPath: /scripts
+      volumes:
+        - name: script-volume
+          configMap:
+            name: {{ $.Release.Name }}-{{ $cluster.name }}-es-restore-script
+            defaultMode: 0755
+{{- end }}
+{{- end }}

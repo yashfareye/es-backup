@@ -1,0 +1,243 @@
+{{- range $cluster := .Values.clusters }}
+{{- if $cluster.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $.Release.Name }}-{{ $cluster.name }}-es-restore-script
+  namespace: {{ $cluster.namespace }}
+data:
+  restore.sh: |
+    set -Eeuo pipefail
+
+    log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >&2; }
+    error() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $*" >&2; }
+
+    KIBANA_SCALED_DOWN=false
+    RESTORE_SUCCESS=false
+
+    get_ready_replicas() {
+      kubectl get deployment "$1" -n "${NAMESPACE}" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0"
+    }
+
+    wait_for_deployment_ready() {
+      local deployment="$1" expected="$2" timeout="$3"
+      log "Waiting for ${deployment} to have ${expected} ready replicas..."
+      local start=$(date +%s)
+      while true; do
+        local ready=$(get_ready_replicas "${deployment}")
+        [ -z "${ready}" ] && ready=0
+        log "${deployment}: ready replicas = ${ready}/${expected}"
+        [ "${ready}" -eq "${expected}" ] && return 0
+        local now=$(date +%s)
+        if [ $((now - start)) -ge "${timeout}" ]; then
+          error "Timeout waiting for ${deployment}."
+          return 1
+        fi
+        sleep 5
+      done
+    }
+
+    cleanup() {
+      local exit_code=$?
+      if [ "${exit_code}" -ne 0 ]; then
+        error "DR restore failed."
+        [ "${KIBANA_SCALED_DOWN}" = "true" ] && error "Kibana will remain scaled to 0 because restore failed."
+        return
+      fi
+      log "Job completed successfully."
+    }
+    trap cleanup EXIT
+
+    es_curl() {
+      local method="$1" url="$2"; shift 2
+      curl --silent --show-error --fail --max-time "${CURL_TIMEOUT}" -X "${method}" "${url}" "$@"
+    }
+
+    get_last_restored() {
+      kubectl get configmap "${STATE_CONFIGMAP}" -n "${NAMESPACE}" -o "jsonpath={.data.cluster-last-restored}" 2>/dev/null || true
+    }
+
+    set_last_restored() {
+      local snapshot="$1"
+      log "Saving restored snapshot state: ${snapshot}"
+      kubectl patch configmap "${STATE_CONFIGMAP}" -n "${NAMESPACE}" --type merge -p "{\"data\":{\"cluster-last-restored\":\"${snapshot}\"}}"
+    }
+
+    get_latest_snapshot() {
+      log "Fetching snapshots from repository ${REPO_NAME}..."
+      local response=$(es_curl GET "${ES_HOST}/_snapshot/${REPO_NAME}/_all")
+      local latest=$(echo "${response}" | jq -r '[.snapshots[] | select(.state == "SUCCESS")] | sort_by(.end_time // .start_time) | last | .snapshot // empty')
+      if [ -z "${latest}" ]; then
+        error "No successful snapshots found."
+        return 1
+      fi
+      log "Latest successful snapshot: ${latest}"
+      echo "${latest}"
+    }
+
+    register_repository() {
+      log "Registering S3 repository ${REPO_NAME}..."
+      local payload=$(cat <<EOF
+    {
+      "type": "s3",
+      "settings": {
+        "bucket": "${S3_BUCKET}",
+        "base_path": "${BASE_PATH}",
+        "region": "${S3_REGION}"
+      }
+    }
+    EOF
+      )
+      local response=$(curl --silent --show-error --fail --max-time "${CURL_TIMEOUT}" -X PUT "${ES_HOST}/_snapshot/${REPO_NAME}" -H "Content-Type: application/json" -d "${payload}")
+      if ! echo "${response}" | jq -e '.acknowledged == true' >/dev/null; then
+        error "Repository registration failed."
+        echo "${response}"
+        return 1
+      fi
+      log "Repository registered successfully."
+    }
+
+    verify_repository() {
+      log "Verifying S3 repository ${REPO_NAME}..."
+      local response=$(es_curl POST "${ES_HOST}/_snapshot/${REPO_NAME}/_verify")
+      if ! echo "${response}" | jq -e '.nodes | length > 0' >/dev/null; then
+        error "Repository verification failed."
+        echo "${response}"
+        return 1
+      fi
+      log "S3 repository verification successful."
+    }
+
+    clean_cluster() {
+      log "Fetching all current Elasticsearch indices..."
+      local all_indices=$(curl --silent --show-error --fail --max-time "${CURL_TIMEOUT}" "${ES_HOST}/_cat/indices/*?h=index&expand_wildcards=open,closed,hidden" | tr -d '\r')
+      
+      if [ -z "${all_indices}" ]; then
+        log "No indices found. Cluster is already clean."
+        return 0
+      fi
+
+      local indices_to_delete=$(echo "${all_indices}" | grep -vE '^\.geoip_databases$' || true)
+      if [ -z "${indices_to_delete}" ]; then
+        log "Only .geoip_databases remains."
+        return 0
+      fi
+
+      while IFS= read -r idx; do
+        [ -z "${idx}" ] && continue
+        if [ "${idx}" = ".geoip_databases" ]; then
+          continue
+        fi
+        log "Deleting index: ${idx}"
+        local delete_response=$(curl --silent --show-error --fail --max-time "${CURL_TIMEOUT}" -X DELETE "${ES_HOST}/${idx}?expand_wildcards=open,closed,hidden")
+        if ! echo "${delete_response}" | jq -e '.acknowledged == true' >/dev/null; then
+          error "Failed to delete index: ${idx}"
+          echo "${delete_response}" >&2
+          return 1
+        fi
+        log "Successfully deleted: ${idx}"
+      done <<< "${indices_to_delete}"
+
+      log "Verifying cluster cleanup..."
+      local remaining_indices=$(curl --silent --show-error --fail --max-time "${CURL_TIMEOUT}" "${ES_HOST}/_cat/indices/*?h=index&expand_wildcards=open,closed,hidden" | tr -d '\r' | grep -vE '^\.geoip_databases$' || true)
+      if [ -n "${remaining_indices}" ]; then
+        error "Cluster cleanup failed. Remaining indices:"
+        echo "${remaining_indices}" >&2
+        return 1
+      fi
+      log "Cluster cleanup successful."
+    }
+
+    restore_snapshot() {
+      local snapshot="$1"
+      log "Starting restore of snapshot ${snapshot}..."
+      local payload='{
+        "indices": "*,-.geoip_databases",
+        "include_global_state": true,
+        "ignore_unavailable": true
+      }'
+      local response=$(curl --silent --show-error --fail --max-time "${CURL_TIMEOUT}" -X POST "${ES_HOST}/_snapshot/${REPO_NAME}/${snapshot}/_restore" -H "Content-Type: application/json" -d "${payload}")
+      if ! echo "${response}" | jq -e '.accepted == true' >/dev/null; then
+        error "Restore was not accepted."
+        echo "${response}" >&2
+        return 1
+      fi
+      log "Restore request accepted."
+    }
+
+    wait_for_health() {
+      log "Waiting for Elasticsearch restore to become healthy..."
+      local start=$(date +%s)
+      while true; do
+        local response=$(curl --silent --show-error --fail --max-time "${CURL_TIMEOUT}" "${ES_HOST}/_cluster/health" 2>/dev/null) || { error "Unable to query health."; response=""; }
+        if [ -n "${response}" ]; then
+          local status=$(echo "${response}" | jq -r '.status // "unknown"')
+          local active_primary_shards=$(echo "${response}" | jq -r '.active_primary_shards // 0')
+          local unassigned_shards=$(echo "${response}" | jq -r '.unassigned_shards // 0')
+          
+          log "Health: ${status} | Primary: ${active_primary_shards} | Unassigned: ${unassigned_shards}"
+          
+          if [ "${active_primary_shards}" -gt 0 ] && [ "${unassigned_shards}" -eq 0 ] && { [ "${status}" = "green" ] || [ "${status}" = "yellow" ]; }; then
+            log "Elasticsearch restore is healthy."
+            return 0
+          fi
+        fi
+        
+        local now=$(date +%s)
+        if [ $((now - start)) -ge "${ES_HEALTH_TIMEOUT}" ]; then
+          error "Health timeout reached."
+          return 1
+        fi
+        sleep "${HEALTH_INTERVAL}"
+      done
+    }
+
+    # MAIN PROCESS
+    log "=============================================="
+    log "Elasticsearch S3 DR Restore Target: ${ES_HOST}"
+    log "=============================================="
+
+    if ! es_curl GET "${ES_HOST}/"; then
+      error "Elasticsearch is not reachable."
+      exit 1
+    fi
+
+    register_repository
+    verify_repository
+
+    LATEST=$(get_latest_snapshot)
+    LAST=$(get_last_restored)
+
+    log "Last restored snapshot: ${LAST:-none}"
+    log "Latest available snapshot: ${LATEST}"
+
+    if [ "${LATEST}" = "${LAST}" ]; then
+      log "Latest snapshot is already restored. No action required."
+      exit 0
+    fi
+
+    log "New snapshot detected: ${LATEST}"
+
+    log "Scaling Kibana down to 0..."
+    kubectl scale deployment/"${KIBANA}" --replicas=0 -n "${NAMESPACE}"
+    KIBANA_SCALED_DOWN=true
+    wait_for_deployment_ready "${KIBANA}" 0 "${KIBANA_TIMEOUT}"
+
+    clean_cluster
+    restore_snapshot "${LATEST}"
+    wait_for_health
+    set_last_restored "${LATEST}"
+
+    RESTORE_SUCCESS=true
+
+    log "Scaling Kibana deployment back to 1..."
+    kubectl scale deployment/"${KIBANA}" --replicas=1 -n "${NAMESPACE}"
+    wait_for_deployment_ready "${KIBANA}" 1 "${KIBANA_TIMEOUT}"
+    KIBANA_SCALED_DOWN=false
+
+    log "=============================================="
+    log "DR Automation completed successfully."
+    log "=============================================="
+{{- end }}
+{{- end }}

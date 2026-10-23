@@ -1,0 +1,36 @@
+clusters:
+  - name: "qa-cluster"
+    enabled: true               # <--- Set to true to create and run the Job
+    namespace: "qa"
+    elasticsearch:
+      host: "http://elasticsearch-test-master.qa.svc.cluster.local:9200"
+    s3:
+      repoName: "fes_es_backup"
+      bucket: "fes-es-backup"
+      basePath: "int-staging-es"
+      region: "eu-west-2"
+    kibana:
+      deploymentName: "kibana-test-kibana"
+    timeouts:
+      curl: "60"
+      kibana: "300"
+      esHealth: "3600"
+      healthInterval: "20"
+
+  - name: "prod-cluster"
+    enabled: true              # <--- Set to false to skip this cluster entirely
+    namespace: "prod"
+    elasticsearch:
+      host: "http://prod-elasticsearch-master.prod.svc.cluster.local:9200"
+    s3:
+      repoName: "prod_es_backup"
+      bucket: "prod-es-backup"
+      basePath: "prod-es"
+      region: "eu-west-2"
+    kibana:
+      deploymentName: "kibana-prod"
+    timeouts:
+      curl: "60"
+      kibana: "300"
+      esHealth: "3600"
+      healthInterval: "20"
